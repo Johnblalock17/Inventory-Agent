@@ -1,26 +1,24 @@
 """
-Multicriteria (Sales × Hits) ABC inventory classification with pandas.
+Multicriteria inventory classification (Sales and Hits, weighted score) with pandas.
 
 Method
 ------
-1. Rank items by Sales ($), highest first, and compute each item's cumulative share of total
-   sales.  An item is class A while the cumulative share *before* it is below the A cutoff
-   (default 80%), B while it is below the B cutoff (default 95%), otherwise C.  So the item
-   that crosses a cutoff joins the higher class.
-2. Do the same for Hits (number of order lines / picks).
-3. Combine the two single-criterion classes with a matrix into A, B, C, D:
-
-        Sales \\ Hits   A   B   C
-              A         A   A   B
-              B         A   B   C
-              C         B   C   D
+1. For Sales ($) and for Hits separately: sort items from highest to lowest, compute each item's
+   cumulative % of the total, and assign a class:
+       cumulative % <= 60  -> A
+       cumulative % <= 80  -> B
+       cumulative % <= 90  -> C
+       cumulative % >  90  -> D
+2. Convert each class to a score: A = 4, B = 3, C = 2, D = 1.
+3. Combined Weighted Score = 0.65 x Sales Score + 0.35 x Hits Score.
+4. Final class:  score >= 3.25 -> A;  2.50-3.24 -> B;  1.75-2.49 -> C;  below 1.75 -> D.
 
 Every number is computed from the uploaded dataframe; nothing is hard-coded from a sample file.
 """
 
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import List
 
 import pandas as pd
 
@@ -28,11 +26,15 @@ REQUIRED_COLUMNS = ["Item Number", "Item Name", "Sales ($)", "Hits"]
 OPTIONAL_COLUMNS = ["UoM"]
 CLASSES = ["A", "B", "C", "D"]
 
-COMBINED_MATRIX: Dict[str, Dict[str, str]] = {      # COMBINED_MATRIX[sales_class][hits_class]
-    "A": {"A": "A", "B": "A", "C": "B"},
-    "B": {"A": "A", "B": "B", "C": "C"},
-    "C": {"A": "B", "B": "C", "C": "D"},
-}
+# Step 1: (upper limit of cumulative %, class), checked in order
+CUMULATIVE_LIMITS = [(60.0, "A"), (80.0, "B"), (90.0, "C")]      # above 90% -> D
+# Step 2
+CLASS_SCORE = {"A": 4, "B": 3, "C": 2, "D": 1}
+# Step 3
+SALES_WEIGHT = 0.65
+HITS_WEIGHT = 0.35
+# Step 4: (minimum combined score, final class), checked in order
+FINAL_THRESHOLDS = [(3.25, "A"), (2.50, "B"), (1.75, "C")]        # below 1.75 -> D
 
 
 class ClassificationError(ValueError):
@@ -69,78 +71,74 @@ def standardize(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def single_criterion_class(values: pd.Series, a_cutoff: float, b_cutoff: float) -> pd.DataFrame:
-    """ABC on one criterion.  Returns rank, share %, cumulative %, and class, aligned to values.index."""
-    order = values.sort_values(ascending=False, kind="mergesort")          # stable: ties keep file order
-    total = order.clip(lower=0).sum()
-    share = order.clip(lower=0) / total * 100 if total > 0 else order * 0.0
-    cum = share.cumsum()
-    before = cum - share                                                   # cumulative % before this item
-    cls = pd.Series("C", index=order.index)
-    cls[before < b_cutoff * 100] = "B"
-    cls[before < a_cutoff * 100] = "A"
-    cls[order <= 0] = "C"                                                  # no sales / no hits is never A or B
-    out = pd.DataFrame({"rank": range(1, len(order) + 1), "share": share, "cum": cum, "class": cls},
-                       index=order.index)
+def class_from_cumulative(cum_pct: float) -> str:
+    """Step 1: cumulative % -> A/B/C/D (limits inclusive)."""
+    cum_pct = round(float(cum_pct), 9)                  # 60.000000001 from float sums counts as 60
+    for limit, cls in CUMULATIVE_LIMITS:
+        if cum_pct <= limit:
+            return cls
+    return "D"
+
+
+def combined_score(sales_score: float, hits_score: float) -> float:
+    """Step 3, rounded to 2 decimals (the precision of the step-4 thresholds)."""
+    return round(SALES_WEIGHT * sales_score + HITS_WEIGHT * hits_score, 2)
+
+
+def final_class(score: float) -> str:
+    """Step 4."""
+    for minimum, cls in FINAL_THRESHOLDS:
+        if score >= minimum:
+            return cls
+    return "D"
+
+
+def single_criterion(values: pd.Series) -> pd.DataFrame:
+    """Step 1 for one criterion: sort high to low, cumulative % of total, class.  Aligned to values.index."""
+    order = values.sort_values(ascending=False, kind="mergesort")           # stable: ties keep file order
+    positive = order.clip(lower=0)
+    total = positive.sum()
+    cum = positive.cumsum() / total * 100 if total > 0 else pd.Series(100.0, index=order.index)
+    out = pd.DataFrame({"cum": cum, "class": cum.map(class_from_cumulative)}, index=order.index)
     return out.reindex(values.index)
 
 
 @dataclass
 class ClassificationResult:
-    data: pd.DataFrame              # uploaded data + classification columns, sorted by class then sales
-    summary: pd.DataFrame           # one row per class A-D
-    matrix_counts: pd.DataFrame     # Sales class × Hits class item counts
-    a_cutoff: float
-    b_cutoff: float
+    data: pd.DataFrame              # one row per item with both classes, both scores and the final class
+    summary: pd.DataFrame           # Class, Items, Total Sales ($) for A-D
     skipped_rows: List[int] = field(default_factory=list)
     negative_rows: List[int] = field(default_factory=list)
 
 
-def classify(df: pd.DataFrame, a_cutoff: float = 0.80, b_cutoff: float = 0.95) -> ClassificationResult:
-    if not 0 < a_cutoff < b_cutoff < 1:
-        raise ClassificationError("Cutoffs must satisfy 0 < A cutoff < B cutoff < 100%.")
+def classify(df: pd.DataFrame) -> ClassificationResult:
     data = standardize(df)
 
     bad = data[["Sales ($)", "Hits"]].isna().any(axis=1)
-    skipped = [int(i) + 2 for i in data.index[bad]]                       # CSV line numbers (header = line 1)
+    skipped = [int(i) + 2 for i in data.index[bad]]                         # CSV line numbers (header = 1)
     negative = [int(i) + 2 for i in data.index[(~bad) & ((data["Sales ($)"] < 0) | (data["Hits"] < 0))]]
-    valid = data[~bad].copy()
-    if valid.empty:
+    items = data[~bad].copy()
+    if items.empty:
         raise ClassificationError("No rows have numeric values in both Sales ($) and Hits.")
 
-    s = single_criterion_class(valid["Sales ($)"], a_cutoff, b_cutoff)
-    h = single_criterion_class(valid["Hits"], a_cutoff, b_cutoff)
-    valid["Sales Rank"] = s["rank"]
-    valid["Sales Share %"] = s["share"]
-    valid["Sales Cum %"] = s["cum"]
-    valid["Sales Class"] = s["class"]
-    valid["Hits Rank"] = h["rank"]
-    valid["Hits Share %"] = h["share"]
-    valid["Hits Cum %"] = h["cum"]
-    valid["Hits Class"] = h["class"]
-    valid["Sales-Hits"] = valid["Sales Class"] + valid["Hits Class"]
-    valid["Class"] = [COMBINED_MATRIX[a][b] for a, b in zip(valid["Sales Class"], valid["Hits Class"])]
+    sales = single_criterion(items["Sales ($)"])
+    hits = single_criterion(items["Hits"])
+    items["Sales Cumulative %"] = sales["cum"]
+    items["Sales Class"] = sales["class"]
+    items["Sales Score"] = items["Sales Class"].map(CLASS_SCORE)
+    items["Hits Cumulative %"] = hits["cum"]
+    items["Hits Class"] = hits["class"]
+    items["Hits Score"] = items["Hits Class"].map(CLASS_SCORE)
+    items["Combined Weighted Score"] = [combined_score(s, h) for s, h in zip(items["Sales Score"], items["Hits Score"])]
+    items["Final Class"] = items["Combined Weighted Score"].map(final_class)
 
-    valid = valid.sort_values(["Class", "Sales ($)", "Hits"], ascending=[True, False, False], kind="mergesort")
+    items = items.sort_values(["Final Class", "Combined Weighted Score", "Sales ($)"],
+                              ascending=[True, False, False], kind="mergesort").reset_index(drop=True)
 
-    total_sales = valid["Sales ($)"].clip(lower=0).sum()
-    total_hits = valid["Hits"].clip(lower=0).sum()
-    grouped = valid.groupby("Class").agg(Items=("Class", "size"),
-                                         Sales=("Sales ($)", lambda x: x.clip(lower=0).sum()),
-                                         Hits=("Hits", lambda x: x.clip(lower=0).sum()))
+    grouped = items.groupby("Final Class").agg(Items=("Final Class", "size"), Sales=("Sales ($)", "sum"))
     grouped = grouped.reindex(CLASSES, fill_value=0)
-    summary = pd.DataFrame({
-        "Class": CLASSES,
-        "Items": grouped["Items"].astype(int).values,
-        "% of Items": (grouped["Items"] / len(valid) * 100).values,
-        "Sales ($)": grouped["Sales"].values,
-        "% of Sales": (grouped["Sales"] / total_sales * 100 if total_sales else grouped["Sales"] * 0).values,
-        "Hits": grouped["Hits"].values,
-        "% of Hits": (grouped["Hits"] / total_hits * 100 if total_hits else grouped["Hits"] * 0).values,
-    })
+    summary = pd.DataFrame({"Class": CLASSES,
+                            "Items": grouped["Items"].astype(int).values,
+                            "Total Sales ($)": grouped["Sales"].values})
 
-    matrix = (pd.crosstab(valid["Sales Class"], valid["Hits Class"])
-              .reindex(index=["A", "B", "C"], columns=["A", "B", "C"], fill_value=0))
-    matrix.index.name, matrix.columns.name = "Sales class", "Hits class"
-
-    return ClassificationResult(valid, summary, matrix, a_cutoff, b_cutoff, skipped, negative)
+    return ClassificationResult(items, summary, skipped, negative)

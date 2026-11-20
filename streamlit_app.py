@@ -18,7 +18,7 @@ import streamlit as st
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # find the agent modules beside this file
 
 import csv_analysis                              # noqa: E402  pandas CSV upload analysis
-import inventory_classification                  # noqa: E402  Sales x Hits A/B/C/D classification
+import inventory_classification                  # noqa: E402  Sales/Hits weighted-score A/B/C/D classification
 from app import EXAMPLES, _parse_answer          # app.py's CLI only runs under `python app.py`
 from inventory_agent import FOLLOW_UPS, INPUT_LABELS, AgentResponse, InventoryAgent
 from inventory_tools import SECTION_TITLES
@@ -235,24 +235,22 @@ def _show_inventory_analysis(df: Any) -> None:
                                 "Units": st.column_config.NumberColumn(format="localized")})
 
 
-def _pct(x: float) -> str:
-    return f"{x:,.1f}%"
-
-
 def show_inventory_classification(df: Any) -> None:
-    """Multicriteria Sales × Hits classification into A, B, C, D (Item Number / Item Name / Sales ($) / Hits files)."""
-    st.subheader("Inventory Classification (Sales × Hits)")
-    st.caption("Each item is ranked by Sales ($) and, separately, by Hits. Items making up the first A-cutoff % of "
-               "the total are class A on that criterion, up to the B cutoff are B, the rest C. The two classes are "
-               "then combined with the matrix below into A, B, C or D.")
-    c1, c2 = st.columns(2)
-    a_cut = c1.number_input("A cutoff (cumulative %)", min_value=1.0, max_value=98.0, value=80.0, step=1.0,
-                            key="abc_a_cutoff")
-    b_cut = c2.number_input("B cutoff (cumulative %)", min_value=2.0, max_value=99.0, value=95.0, step=1.0,
-                            key="abc_b_cutoff")
+    """Multicriteria Sales/Hits classification with a weighted score (Item Number / Item Name / Sales ($) / Hits files)."""
+    ic = inventory_classification
+    st.subheader("Inventory Classification (Sales and Hits)")
+    with st.expander("Method", expanded=False):
+        st.markdown(
+            "1. For **Sales ($)** and for **Hits** separately, sort items from highest to lowest and compute each "
+            "item's cumulative % of the total. Cumulative % up to 60% is **A**, up to 80% is **B**, up to 90% is "
+            "**C**, and above 90% is **D**.\n"
+            "2. Convert each class to a score: A = 4, B = 3, C = 2, D = 1.\n"
+            f"3. Combined Weighted Score = {ic.SALES_WEIGHT:.2f} × Sales Score + {ic.HITS_WEIGHT:.2f} × Hits Score.\n"
+            "4. Final class: **A** if the score is 3.25 or higher, **B** if 2.50 to 3.24, **C** if 1.75 to 2.49, "
+            "**D** if below 1.75.")
     try:
-        r = inventory_classification.classify(df, a_cut / 100, b_cut / 100)
-    except inventory_classification.ClassificationError as exc:
+        r = ic.classify(df)
+    except ic.ClassificationError as exc:
         st.error(str(exc))
         return
 
@@ -260,42 +258,29 @@ def show_inventory_classification(df: Any) -> None:
         st.warning("Rows with a non-numeric Sales ($) or Hits were left out of the classification "
                    f"(CSV line{'s' if len(r.skipped_rows) > 1 else ''} " + ", ".join(map(str, r.skipped_rows)) + ").")
     if r.negative_rows:
-        st.warning("Negative Sales ($) or Hits were counted as 0 when computing shares "
+        st.warning("Negative Sales ($) or Hits were counted as 0 when computing cumulative % "
                    f"(CSV line{'s' if len(r.negative_rows) > 1 else ''} " + ", ".join(map(str, r.negative_rows)) + ").")
 
     cols = st.columns(4)
     for col, (_, row) in zip(cols, r.summary.iterrows()):
         n = int(row["Items"])
         col.metric(f"Class {row['Class']}", f"{n:,} item{'' if n == 1 else 's'}",
-                   help=f"{_pct(row['% of Sales'])} of sales, {_pct(row['% of Hits'])} of hits")
+                   help=f"Total sales {_money(row['Total Sales ($)'])}")
 
-    left, right = st.columns([3, 2])
-    with left:
-        st.markdown("**Summary by class**")
-        st.dataframe(r.summary, hide_index=True, width="stretch", column_config={
-            "% of Items": st.column_config.NumberColumn(format="%.1f%%"),
-            "Sales ($)": st.column_config.NumberColumn(format="dollar"),
-            "% of Sales": st.column_config.NumberColumn(format="%.1f%%"),
-            "Hits": st.column_config.NumberColumn(format="localized"),
-            "% of Hits": st.column_config.NumberColumn(format="%.1f%%")})
-    with right:
-        st.markdown("**Combination rule** (Sales class × Hits class → Class)")
-        rule = inventory_classification.COMBINED_MATRIX
-        counts = r.matrix_counts
-        st.dataframe([{"Sales \\ Hits": s, **{h: f"{rule[s][h]}  ({int(counts.loc[s, h])} items)" for h in "ABC"}}
-                      for s in "ABC"], hide_index=True, width="stretch")
+    st.markdown("**Summary by final class**")
+    st.dataframe(r.summary, hide_index=True, width="stretch", column_config={
+        "Items": st.column_config.NumberColumn(format="localized"),
+        "Total Sales ($)": st.column_config.NumberColumn(format="dollar")})
 
     st.markdown("**Classified items**")
-    show = st.multiselect("Show classes", inventory_classification.CLASSES,
-                          default=inventory_classification.CLASSES, key="abc_filter")
-    table = r.data[r.data["Class"].isin(show)]
+    show = st.multiselect("Show final classes", ic.CLASSES, default=ic.CLASSES, key="abc_filter")
+    table = r.data[r.data["Final Class"].isin(show)]
     st.dataframe(table, hide_index=True, width="stretch", column_config={
         "Sales ($)": st.column_config.NumberColumn(format="dollar"),
         "Hits": st.column_config.NumberColumn(format="localized"),
-        "Sales Share %": st.column_config.NumberColumn(format="%.2f%%"),
-        "Sales Cum %": st.column_config.NumberColumn(format="%.2f%%"),
-        "Hits Share %": st.column_config.NumberColumn(format="%.2f%%"),
-        "Hits Cum %": st.column_config.NumberColumn(format="%.2f%%")})
+        "Sales Cumulative %": st.column_config.NumberColumn(format="%.2f%%"),
+        "Hits Cumulative %": st.column_config.NumberColumn(format="%.2f%%"),
+        "Combined Weighted Score": st.column_config.NumberColumn(format="%.2f")})
     st.download_button("Download classified items (CSV)", r.data.to_csv(index=False).encode(),
                        file_name="inventory_classification.csv", mime="text/csv", key="abc_download")
 
