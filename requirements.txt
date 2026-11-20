@@ -1,0 +1,5 @@
+# Core agent and calculators use only the Python standard library (3.9+).
+pytest>=7.0
+
+# Optional: only needed for `python app.py --llm` (Claude reads the question; Python still does all math).
+anthropic>=0.125.0
