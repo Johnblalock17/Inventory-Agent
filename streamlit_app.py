@@ -17,6 +17,7 @@ import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # find the agent modules beside this file
 
+import csv_analysis                              # noqa: E402  pandas CSV upload analysis
 from app import EXAMPLES, _parse_answer          # app.py's CLI only runs under `python app.py`
 from inventory_agent import FOLLOW_UPS, INPUT_LABELS, AgentResponse, InventoryAgent
 from inventory_tools import SECTION_TITLES
@@ -155,6 +156,73 @@ def show_response(agent: InventoryAgent, resp: AgentResponse) -> None:
             st.text(f"{i}. {t}")
 
 
+# --------------------------------------------------------------------------- CSV data analysis
+
+def _money(x: float) -> str:
+    return f"-${abs(x):,.2f}" if x < 0 else f"${x:,.2f}"
+
+
+def _units(x: float) -> str:
+    return f"{x:,.0f}" if float(x).is_integer() else f"{x:,.2f}"
+
+
+def show_data_analysis(uploaded: Any) -> None:
+    """Read the uploaded CSV with pandas, then show the data and the analysis."""
+    st.divider()
+    st.header("Data Analysis")
+    st.caption(f"File: {getattr(uploaded, 'name', 'uploaded CSV')}")
+
+    try:
+        df = csv_analysis.read_csv(uploaded)
+    except csv_analysis.CSVDataError as exc:
+        st.error(str(exc))
+        return
+
+    st.subheader("Uploaded data")
+    st.dataframe(df, hide_index=True, width="stretch")
+    c1, c2 = st.columns(2)
+    c1.metric("Rows", f"{len(df):,}")
+    c2.metric("Columns", f"{len(df.columns):,}")
+    st.markdown("**Column names:** " + ", ".join(f"`{c}`" for c in df.columns))
+
+    missing = csv_analysis.missing_columns(df)
+    if missing:
+        st.error("This file is missing the required column(s): **" + ", ".join(missing) + "**.\n\n"
+                 "Required columns: " + ", ".join(csv_analysis.REQUIRED_COLUMNS) + ".")
+        return
+
+    try:
+        result = csv_analysis.analyze(df)
+    except csv_analysis.CSVDataError as exc:
+        st.error(str(exc))
+        return
+
+    if result.skipped_rows:
+        st.warning("Rows with a non-numeric Units or Unit Cost were left out of the totals "
+                   f"(CSV line{'s' if len(result.skipped_rows) > 1 else ''} "
+                   + ", ".join(map(str, result.skipped_rows)) + ").")
+
+    st.subheader("Results")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total Units", _units(result.total_units))
+    m2.metric("Average Unit Cost", _money(result.average_unit_cost))
+    m3.metric("Product with Highest Units", ", ".join(result.top_products),
+              help=f"{_units(result.top_units)} units")
+    m4.metric("Total Inventory Value", _money(result.total_inventory_value))
+    st.caption(f"Highest Units: {_units(result.top_units)}"
+               + (" (tie)" if len(result.top_products) > 1 else ""))
+
+    st.markdown("**Total Units by Category**")
+    st.dataframe(result.units_by_category, hide_index=True, width="stretch",
+                 column_config={"Total Units": st.column_config.NumberColumn(format="localized")})
+
+    st.markdown("**Data with Inventory Value** (Inventory Value = Units × Unit Cost)")
+    st.dataframe(result.data, hide_index=True, width="stretch",
+                 column_config={"Unit Cost": st.column_config.NumberColumn(format="dollar"),
+                                "Inventory Value": st.column_config.NumberColumn(format="dollar"),
+                                "Units": st.column_config.NumberColumn(format="localized")})
+
+
 # --------------------------------------------------------------------------- page
 
 def main() -> None:
@@ -175,6 +243,10 @@ def main() -> None:
                 st.session_state.question = ex
                 st.session_state.pop("resp", None)
 
+        st.divider()
+        st.subheader("Data Upload")
+        uploaded = st.file_uploader("Upload CSV File", type=["csv"], key="csv_upload")
+
     agent = make_agent(use_llm)
     with st.form("ask"):
         question = st.text_area("Your question", key="question", height=120,
@@ -189,6 +261,9 @@ def main() -> None:
 
     if "resp" in st.session_state:
         show_response(agent, st.session_state.resp)
+
+    if uploaded is not None:
+        show_data_analysis(uploaded)
 
 
 main()
